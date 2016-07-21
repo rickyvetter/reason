@@ -18,7 +18,7 @@ let () =
      * `reason.cma`.
      *)
     Pkg.lib ~cond:(Env.bool "utop") ~exts:Exts.library "src/reason" ~dst:"reason";
-    Pkg.lib ~cond:(not (Env.bool "utop")) ~exts:Exts.library "src/reason_without_utop" ~dst:"reason";
+    Pkg.lib ~exts:Exts.library "src/reason_without_utop" ~dst:"reason_without_utop";
     (* But then regardless of if we have `utop` installed - still compile a
        library when the use case demands that there be no `utop` *)
     Pkg.lib ~exts:[`Ext ".cmo"; `Ext ".cmx";`Ext ".cmi"; `Ext ".cmt";`Ext ".mli"] "src/reason_parser";
