@@ -1169,7 +1169,8 @@ let isListy = function
 let strip_trailing_whitespace str =
    Re_str.global_replace (Re_str.regexp " +$") "" str
 
-let easyFormatToFormatter f x =
+
+let easyFormatToFormatterImpl f x =
   let buf = Buffer.create 1000 in
   let fauxmatter = Format.formatter_of_buffer buf in
   let _ = Format.pp_set_margin fauxmatter settings.width in
@@ -1177,8 +1178,16 @@ let easyFormatToFormatter f x =
     Easy_format.Pretty.define_styles fauxmatter html_escape html_style;
   let _ = Easy_format.Pretty.to_formatter fauxmatter x in
   let trimmed = strip_trailing_whitespace (Buffer.contents buf) |> String.trim in
-  Format.fprintf f "%s\n" trimmed;
+  Format.fprintf f "%s\n" trimmed
+
+let easyFormatToFormatter f x =
+  easyFormatToFormatterImpl f x;
   pp_print_flush f ()
+
+let easyFormatToStringFormatter x =
+  ignore (flush_str_formatter ());
+  easyFormatToFormatterImpl Format.str_formatter x;
+  flush_str_formatter ()
 
 
 let wrapToStr fn = fun term ->
@@ -5460,19 +5469,31 @@ let preprocessing_chain = [add_explicit_arity_mapper; escape_stars_slashes_mappe
 
 let core_type f x =
   easyFormatToFormatter f (layoutToEasyFormatNoComments (easy#core_type (apply_mapper_chain_to_type x preprocessing_chain)))
+let core_type_string x =
+  easyFormatToStringFormatter (layoutToEasyFormatNoComments (easy#core_type (apply_mapper_chain_to_type x preprocessing_chain)))
 let pattern f x =
   easyFormatToFormatter f (layoutToEasyFormatNoComments (easy#pattern (apply_mapper_chain_to_pattern x preprocessing_chain)))
+let pattern_string x =
+  easyFormatToStringFormatter (layoutToEasyFormatNoComments (easy#pattern (apply_mapper_chain_to_pattern x preprocessing_chain)))
 let signature comments f x =
   easyFormatToFormatter f (layoutToEasyFormat (easy#signature (apply_mapper_chain_to_signature x preprocessing_chain)) comments)
+let signature_string comments x =
+  easyFormatToStringFormatter (layoutToEasyFormat (easy#signature (apply_mapper_chain_to_signature x preprocessing_chain)) comments)
 let structure comments f x =
   easyFormatToFormatter f (layoutToEasyFormat (easy#structure (apply_mapper_chain_to_structure x preprocessing_chain)) comments)
+let structure_string comments x =
+  easyFormatToStringFormatter (layoutToEasyFormat (easy#structure (apply_mapper_chain_to_structure x preprocessing_chain)) comments)
 end
 in
 object
   method core_type = Formatter.core_type
+  method core_type_string = Formatter.core_type_string
   method pattern = Formatter.pattern
+  method pattern_string = Formatter.pattern_string
   method signature = Formatter.signature
+  method signature_string = Formatter.signature_string
   method structure = Formatter.structure
+  method structure_string = Formatter.structure_string
 end
 
 
