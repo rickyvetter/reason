@@ -73,5 +73,11 @@
     "engines" : {
       "npm" : ">=3.10.0"
     },
-    "rebel": {}
+    "rebel": {
+      "ocamlfindDependencies": [
+        "outcometree",
+        "ocamlbuild_pack",
+        "ast_mapper"
+      ]
+    }
 }
