@@ -119,6 +119,26 @@ let jsxMapper () =
     let wrapWithReasonReactElement e = (* ReasonReact.element(~key, ~ref, ...) *)
       Exp.apply
         ~loc
+        (Exp.ident ~loc {loc; txt = Ldot (Lident "ReactHooks", "createElement")})
+        (* (Exp.ident ~loc {loc; txt = Ldot (modulePath, "make")}) *)
+        ([(nolabel, (Exp.ident ~loc {loc; txt = Ldot (modulePath, "make")}))] @ (argsKeyRef @ [(nolabel, e)])) in
+    Exp.apply
+      ~loc
+      ~attrs
+      (* Foo.make *)
+      (Exp.ident ~loc {loc; txt = Ldot (modulePath, "props")})
+      args
+    |> wrapWithReasonReactElement in
+
+  let transformUppercaseCall3 modulePath mapper loc attrs _ callArguments =
+    let (children, argsWithLabels) = extractChildren ~loc ~removeLastPositionUnit:true callArguments in
+    let (argsKeyRef, argsForMake) = List.partition argIsKeyRef argsWithLabels in
+    let childrenExpr = transformChildrenIfList ~loc ~mapper children in
+    let recursivelyTransformedArgsForMake = argsForMake |> List.map (fun (label, expression) -> (label, mapper.expr mapper expression)) in
+    let args = recursivelyTransformedArgsForMake @ [ (nolabel, childrenExpr) ] in
+    let wrapWithReasonReactElement e = (* ReasonReact.element(~key, ~ref, ...) *)
+      Exp.apply
+        ~loc
         (Exp.ident ~loc {loc; txt = Ldot (Lident "ReasonReact", "element")})
         (argsKeyRef @ [(nolabel, e)]) in
     Exp.apply
@@ -185,6 +205,7 @@ let jsxMapper () =
       args
   in
 
+
   let transformJsxCall mapper callExpression callArguments attrs =
     (match callExpression.pexp_desc with
      | Pexp_ident caller ->
@@ -197,7 +218,8 @@ let jsxMapper () =
           (match !jsxVersion with
           | None
           | Some 2 -> transformUppercaseCall modulePath mapper loc attrs callExpression callArguments
-          | Some _ -> raise (Invalid_argument "JSX: the JSX version must be 2"))
+          | Some 3 -> transformUppercaseCall3 modulePath mapper loc attrs callExpression callArguments
+          | Some _ -> raise (Invalid_argument "JSX: the JSX version must be 2 or 3"))
 
         (* div(~prop1=foo, ~prop2=bar, ~children=[bla], ()) *)
         (* turn that into
@@ -259,12 +281,14 @@ let jsxMapper () =
           | ((_, {pexp_desc = Pexp_constant (Pconst_integer (version, _))})::_, recordFieldsWithoutJsx) -> begin
               (match version with
               | "2" -> jsxVersion := Some 2
-              | _ -> raise (Invalid_argument "JSX: the file-level bs.config's jsx version must be 2"));
+              | "3" -> jsxVersion := Some 3
+              | _ -> raise (Invalid_argument "JSX: the file-level bs.config's jsx version must be 2 or 3"));
 (* #else
           | ((_, {pexp_desc = Pexp_constant (Const_int version)})::rest, recordFieldsWithoutJsx) -> begin
               (match version with
               | 2 -> jsxVersion := Some 2
-              | _ -> raise (Invalid_argument "JSX: the file-level bs.config's jsx version must be 2"));
+              | 3 -> jsxVersion := Some 3
+              | _ -> raise (Invalid_argument "JSX: the file-level bs.config's jsx version must be 2 or 3"));
 #end *)
               match recordFieldsWithoutJsx with
               (* record empty now, remove the whole bs.config attribute *)
@@ -284,6 +308,19 @@ let jsxMapper () =
 
   let expr =
     (fun mapper expression -> match expression with
+      | {
+        pexp_desc = Pexp_fun (arg_label, expressionOption, pattern, expression);
+        pexp_attributes
+        } ->
+        let (componentAttribute, nonComponentAttributes) = List.partition (fun (attribute, _) -> attribute.txt = "react.component") pexp_attributes in
+        (match (componentAttribute, nonComponentAttributes) with
+        (* no JSX attribute *)
+        | ([], _) -> default_mapper.expr mapper expression
+        | (_, nonComponentAttributes) ->
+          let _ = print_endline "wowsers" in
+          default_mapper.expr mapper expression)
+
+
        (* Does the function application have the @JSX attribute? *)
        | {
            pexp_desc = Pexp_apply (callExpression, callArguments);

@@ -16,7 +16,9 @@
 	],
 	"license": "MIT",
 	"homepage": "https://github.com/facebook/reason",
-	"dependencies": {},
+	"dependencies": {
+		"npm": "^6.5.0"
+	},
 	"devDependencies": {
 		"bs-platform": "1.9.3"
 	},

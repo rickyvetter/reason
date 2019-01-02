@@ -19,7 +19,7 @@ fi
 
 for version in v2
 do
-  for i in {1..2}
+  for i in {1..3}
   do
     test="$testPath/test$i.re"
     expected="$testPath/expected_${version}_${i}.re"
@@ -27,9 +27,8 @@ do
 
     # for each test, we're gonna use ocamlc and the ppx to dump the post-ppx ocaml
     # file somewhere
-
-    ocamlc -dsource -ppx "./_build/install/default/bin/reactjs_jsx_ppx_${version}" \
-      -pp "./_build/install/default/bin/refmt --print binary" -impl $test \
+    ocamlc -dsource -ppx "./_esy/default/build/install/default/bin/reactjs_jsx_ppx_${version}" \
+      -pp "./_esy/default/build/install/default/bin/refmt --print binary" -impl $test \
       2> $tempFile
 
     # if there's an Error/Fatal error, bail early
@@ -40,7 +39,7 @@ do
       exit 1
     fi
     # no error
-    ./_build/install/default/bin/refmt --print-width 80 --parse ml --print re $tempFile > $actual
+    ./_esy/default/build/install/default/bin/refmt --print-width 80 --parse ml --print re $tempFile > $actual
 
     rm $tempFile
 
