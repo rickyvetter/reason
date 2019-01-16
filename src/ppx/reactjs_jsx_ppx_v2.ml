@@ -67,22 +67,28 @@ open Asttypes
 open Parsetree
 open Longident
 
+type 'a children = | ListLiteral of 'a | Exact of 'a
+
 (* if children is a list, convert it to an array while mapping each element. If not, just map over it, as usual *)
-let transformChildrenIfList ~loc ~mapper theList =
+let transformChildrenIfListWithType ~loc ~mapper theList =
   let rec transformChildren_ theList accum =
     (* not in the sense of converting a list to an array; convert the AST
        reprensentation of a list to the AST reprensentation of an array *)
     match theList with
     | {pexp_desc = Pexp_construct ({txt = Lident "[]"}, None)} ->
-      List.rev accum |> Exp.array ~loc
+      ListLiteral (List.rev accum |> Exp.array ~loc)
     | {pexp_desc = Pexp_construct (
         {txt = Lident "::"},
         Some {pexp_desc = Pexp_tuple (v::acc::[])}
       )} ->
       transformChildren_ acc ((mapper.expr mapper v)::accum)
-    | notAList -> mapper.expr mapper notAList
+    | notAList -> Exact (mapper.expr mapper notAList)
   in
   transformChildren_ theList []
+
+let transformChildrenIfList ~loc ~mapper theList =
+  match transformChildrenIfListWithType ~loc ~mapper theList with
+  | Exact exp | ListLiteral exp -> exp
 
 let extractChildren ?(removeLastPositionUnit=false) ~loc propsAndChildren =
   let rec allButLast_ lst acc = match lst with
@@ -110,27 +116,113 @@ let jsxMapper () =
 
   let jsxVersion = ref None in
 
-  let transformUppercaseCall modulePath mapper loc attrs _ callArguments =
+  let transformUppercaseCall3 modulePath mapper loc attrs _ callArguments =
     let (children, argsWithLabels) = extractChildren ~loc ~removeLastPositionUnit:true callArguments in
     let (argsKeyRef, argsForMake) = List.partition argIsKeyRef argsWithLabels in
-    let childrenExpr = transformChildrenIfList ~loc ~mapper children in
+    let childrenExpr = transformChildrenIfListWithType ~loc ~mapper children in
     let recursivelyTransformedArgsForMake = argsForMake |> List.map (fun (label, expression) -> (label, mapper.expr mapper expression)) in
-    let args = recursivelyTransformedArgsForMake @ [ (nolabel, childrenExpr) ] in
-    let wrapWithReasonReactElement e = (* ReasonReact.element(~key, ~ref, ...) *)
+    let args = recursivelyTransformedArgsForMake
+      @ (match childrenExpr with
+        | Exact children -> [(Labelled "children", children)]
+        | ListLiteral ({ pexp_desc = Pexp_array list } as expression) when list = [] -> []
+        | ListLiteral _ -> [(Labelled "children", Exp.ident ~loc {loc; txt = Ldot (Lident "ReasonReact", "null")})])
+      @ [ (nolabel, Exp.construct {txt = Lident "()"; loc} None) ] in
+    let ident = match modulePath with
+    | Lident justModule -> Ldot (modulePath, "make")
+    | modulePath -> modulePath in
+    let propsIdent = match modulePath with
+    | Lident justModule -> Ldot (modulePath, "props")
+    | Ldot(ident, path) -> Ldot (ident, path ^ "_props")
+    | modulePath -> modulePath in
+    let wrapWithKeyOrRef wrapper =
+      let (_, expression) = wrapper in
+      let wrapperFnName = match wrapper with
+      | (Asttypes.Labelled "key", _) | (Asttypes.Optional "key", _) -> "wrapKey"
+      | (Asttypes.Labelled "ref", _) | (Asttypes.Optional "ref", _) -> "wrapRef"
+      | _ -> raise (Invalid_argument "Only ref and key are special cased React props.") in
+      Vb.mk ~loc (Pat.mk ~loc Ppat_any) (
+        Exp.apply
+         ~loc
+         (Exp.ident ~loc {loc; txt = Ldot (Lident "ReactHooks", wrapperFnName)})
+         [(nolabel, Exp.ident ~loc {loc; txt = Lident "tmpProps"}); (nolabel, expression)]
+       ) in
+    let wrapPropsWithRefAndKey props =
+      Exp.let_ ~loc Nonrecursive ([Vb.mk ~loc (Pat.mk ~loc (Ppat_var {txt = "tmpProps"; loc})) (
+        Exp.apply
+        ~attrs
+        (* Foo.make *)
+        (Exp.ident ~loc {loc; txt = propsIdent})
+        args
+       )] @ (List.map wrapWithKeyOrRef argsKeyRef)) (Exp.ident ~loc {loc; txt = Lident "tmpProps"}) in
+    (* handle key, ref, children *)
+    let wrapWithReasonReactElement e = (* ReactHooks.createElement(Component.make, props, ...children) *)
       Exp.apply
         ~loc
         (Exp.ident ~loc {loc; txt = Ldot (Lident "ReactHooks", "createElement")})
         (* (Exp.ident ~loc {loc; txt = Ldot (modulePath, "make")}) *)
-        ([(nolabel, (Exp.ident ~loc {loc; txt = Ldot (modulePath, "make")}))] @ (argsKeyRef @ [(nolabel, e)])) in
+        ([
+          (nolabel, Exp.ident ~loc {txt = ident; loc});
+          (nolabel, wrapPropsWithRefAndKey (Exp.ident ~loc {loc; txt = ident}));
+          (nolabel, match childrenExpr with
+            | Exact _ -> Exp.array []
+            | ListLiteral arr -> arr);
+        ]) in
     Exp.apply
       ~loc
       ~attrs
       (* Foo.make *)
-      (Exp.ident ~loc {loc; txt = Ldot (modulePath, "props")})
+      (Exp.ident ~loc {loc; txt = propsIdent})
       args
     |> wrapWithReasonReactElement in
 
-  let transformUppercaseCall3 modulePath mapper loc attrs _ callArguments =
+    let transformLowercaseCall3 mapper loc attrs callArguments id =
+      let (children, nonChildrenProps) = extractChildren ~loc callArguments in
+      let componentNameExpr = constantString ~loc id in
+      let childrenExpr = transformChildrenIfList ~loc ~mapper children in
+      let createElementCall = match children with
+        (* [@JSX] div(~children=[a]), coming from <div> a </div> *)
+        | {
+            pexp_desc =
+             Pexp_construct ({txt = Lident "::"}, Some {pexp_desc = Pexp_tuple _ })
+             | Pexp_construct ({txt = Lident "[]"}, None)
+          } -> "createStringElement"
+        (* [@JSX] div(~children= value), coming from <div> ...(value) </div> *)
+        | _ -> raise (Invalid_argument "A spread as a DOM element's \
+          children don't make sense written together. You can simply remove the spread.")
+      in
+      let args = match nonChildrenProps with
+        | [_justTheUnitArgumentAtEnd] ->
+          [
+            (* "div" *)
+            (nolabel, componentNameExpr);
+            (* [|moreCreateElementCallsHere|] *)
+            (nolabel, childrenExpr)
+          ]
+        | nonEmptyProps ->
+          let propsCall =
+            Exp.apply
+              ~loc
+              (Exp.ident ~loc {loc; txt = Ldot (Lident "ReactHooks", "domProps")})
+              (nonEmptyProps |> List.map (fun (label, expression) -> (label, mapper.expr mapper expression)))
+          in
+          [
+            (* "div" *)
+            (nolabel, componentNameExpr);
+            (* ReactDOMRe.props(~className=blabla, ~foo=bar, ()) *)
+            (labelled "props", propsCall);
+            (* [|moreCreateElementCallsHere|] *)
+            (nolabel, childrenExpr)
+          ] in
+      Exp.apply
+        ~loc
+        (* throw away the [@JSX] attribute and keep the others, if any *)
+        ~attrs
+        (* ReactDOMRe.createElement *)
+        (Exp.ident ~loc {loc; txt = Ldot (Lident "ReactHooks", createElementCall)})
+        args
+    in
+
+  let transformUppercaseCall modulePath mapper loc attrs _ callArguments =
     let (children, argsWithLabels) = extractChildren ~loc ~removeLastPositionUnit:true callArguments in
     let (argsKeyRef, argsForMake) = List.partition argIsKeyRef argsWithLabels in
     let childrenExpr = transformChildrenIfList ~loc ~mapper children in
@@ -205,6 +297,193 @@ let jsxMapper () =
       args
   in
 
+  let rec recursivelyTransformNamedArgsForMake expr list =
+    match expr.pexp_desc with
+    | Pexp_fun (Labelled(label), defaultArg, _, expression) ->
+        recursivelyTransformNamedArgsForMake expression ((label, defaultArg, false) :: list)
+    | Pexp_fun (Optional(label), defaultArg, _, expression) ->
+        recursivelyTransformNamedArgsForMake expression ((label, defaultArg, true) :: list)
+    | Pexp_fun (Nolabel, _, { ppat_desc = Ppat_construct ({txt = Lident "()"}, _) }, expression) -> (expression.pexp_desc, list)
+    | innerExpression -> (innerExpression, list)
+  in
+
+  let rec recursivelyMakeNamedArgsForExternal loc list args = match list with
+  | (label, _, optional)::tl ->
+    recursivelyMakeNamedArgsForExternal loc tl (Ast_404.Ast_helper.Typ.arrow
+    (if optional then Optional(label) else Labelled(label))
+    {
+      ptyp_desc = Ptyp_var label;
+      ptyp_loc = loc;
+      ptyp_attributes = [];
+    } args)
+  | [] -> args
+  in
+
+  let transformComponentDefinition structure returnStructures = match structure with
+  | {
+      pstr_loc;
+      pstr_desc = Pstr_value (
+        foo,
+        valueBindings
+      )
+    } ->
+      let typeDecls = ref [] in
+      let externals = ref [] in
+      let names = ref [] in
+      let bsRawCreate functionName variableName =
+        functionName ^ ".name = '" ^ variableName ^ "';" in
+      let setNamesForBSRaw functionName (loc, payload) =
+        match payload with
+        | PStr [
+          {pstr_desc = Pstr_eval ({
+            pexp_desc = Pexp_constant (Pconst_string (str, delim))
+          } as innest , _)} as inner
+        ] -> let name =
+        {inner with pstr_desc = Pstr_eval (
+          {innest with pexp_desc = Pexp_extension (
+            {txt = "bs.raw"; loc = loc.loc},
+            PStr [
+            {inner with pstr_desc = Pstr_eval (
+              {innest with pexp_desc = Pexp_constant (Pconst_string (bsRawCreate functionName str, delim))},
+              []
+            )}]
+          )},
+          []
+        )} in
+        names := name :: !names
+        (* todo: add __MODULE__ here *)
+        | _ -> ()
+      in
+      let hasAttr (loc, _) =
+        loc.txt = "react.component" in
+      let otherAttrsPure (loc, _) =
+        loc.txt <> "react.component" in
+      let hasAttrOnBinding {pvb_attributes} = match (List.find_opt hasAttr pvb_attributes) with | Some(_) -> true | None -> false in
+      let filterAttrOnBinding binding = {binding with pvb_attributes = List.filter otherAttrsPure binding.pvb_attributes} in
+      let mapBinding binding = if (hasAttrOnBinding binding) then
+        let fnName = match binding with
+        | {pvb_pat = {
+            ppat_desc = Ppat_var {txt}
+          }} -> txt
+        | _ -> raise (Invalid_argument "react.component should only be used on a function declaration.") in
+        let _ = List.iter (setNamesForBSRaw fnName) binding.pvb_attributes in
+        let binding = filterAttrOnBinding binding in
+        (* do stuff here! *)
+        let (innerFunctionExpression, namedArgList) = recursivelyTransformNamedArgsForMake binding.pvb_expr [] in
+        let argToType (name, _optionalExpression, _) = (name, [], {
+          ptyp_desc = Ptyp_var name;
+          ptyp_loc = pstr_loc;
+          ptyp_attributes = [];
+          }) in
+        let pluckType (_, _, coreType) = coreType in
+        let argToTypeParam (name, _optionalExpression, _) = ({
+          ptyp_desc = Ptyp_var name;
+          ptyp_loc = pstr_loc;
+          ptyp_attributes = [];
+          }, Invariant) in
+        let namedTypeList = List.map argToType namedArgList in
+        let justNamedTypeList = List.map pluckType namedTypeList in
+        let namedTypeParamsList = List.map argToTypeParam namedArgList in
+
+        let typeDecl = {pstr_desc= Pstr_type (Recursive, [{
+          (* ptype_params = foo; *)
+          ptype_name = {txt = "t"; loc = pstr_loc};
+          ptype_params = namedTypeParamsList;
+          ptype_loc = pstr_loc;
+          ptype_cstrs = [];
+          ptype_kind = Ptype_abstract;
+          ptype_private = Public;
+          ptype_attributes = [];
+          ptype_manifest = Some({
+            ptyp_desc = Ptyp_constr({txt= Lident("Js.t"); loc= pstr_loc}, [{
+                ptyp_desc = Ptyp_object(namedTypeList, Closed);
+                ptyp_loc = pstr_loc;
+                ptyp_attributes = [];
+              }]);
+            ptyp_loc = pstr_loc;
+            ptyp_attributes = [];
+            });
+          }]);
+          pstr_loc = pstr_loc} in
+          let _ = typeDecls := typeDecl :: !typeDecls in
+
+        let externalDecl = {
+          pstr_loc = pstr_loc;
+          pstr_desc = Pstr_primitive {
+            pval_name = {txt = "props"; loc = pstr_loc};
+            pval_type =
+               recursivelyMakeNamedArgsForExternal
+                 pstr_loc
+                 namedArgList
+                 (Ast_404.Ast_helper.Typ.arrow
+                 Nolabel
+                 {
+                   ptyp_desc = Ptyp_constr ({txt= Lident("unit"); loc = pstr_loc}, []);
+                   ptyp_loc = pstr_loc;
+                   ptyp_attributes = [];
+                 }
+                 (Ast_404.Ast_helper.Typ.mk(Ptyp_constr({txt= Lident("t"); loc= pstr_loc}, justNamedTypeList))));
+            pval_prim = [];
+            pval_attributes = [({txt = "bs.obj"; loc = pstr_loc}, PStr [])];
+            pval_loc = pstr_loc;
+          }
+        } in
+        let _ = externals := externalDecl :: !externals in
+        let makeLet (label, _, optional) =
+          Ast_404.Ast_helper.Vb.mk
+            (Ast_404.Ast_helper.Pat.var {txt = label; loc = pstr_loc})
+            (Ast_404.Ast_helper.Exp.apply
+              (Ast_404.Ast_helper.Exp.ident {txt = (Lident "##"); loc = pstr_loc })
+              [
+                (Nolabel, Ast_404.Ast_helper.Exp.ident {txt = (Lident "__reactprops__"); loc = pstr_loc });
+                (Nolabel, Ast_404.Ast_helper.Exp.ident {txt = (Lident label); loc = pstr_loc })
+              ]
+            ) in
+        let innerLets = List.map makeLet namedArgList in
+        {
+          binding with
+          pvb_expr = Ast_404.Ast_helper.Exp.mk(Pexp_fun (
+            Nolabel,
+            None,
+            {
+              ppat_desc = Ppat_var {txt = "__reactprops__"; loc = pstr_loc};
+              ppat_loc = pstr_loc;
+              ppat_attributes = [];
+            },
+            Ast_404.Ast_helper.Exp.mk(Pexp_let (
+              Nonrecursive,
+              innerLets,
+              (Ast_404.Ast_helper.Exp.mk innerFunctionExpression)
+            ))
+          ))
+        }
+      else
+        binding
+      in
+      let mappedBindings = List.map mapBinding valueBindings in
+      let returnStructures = {
+          pstr_loc;
+          pstr_desc = Pstr_value (
+            foo,
+            mappedBindings
+          )
+      } :: returnStructures in
+      let returnStructures = if !externals != [] then
+        List.concat [!externals; returnStructures] else begin
+        returnStructures end in
+      let returnStructures = if !typeDecls != [] then
+        List.concat [!typeDecls; returnStructures] else begin
+        returnStructures end in
+      let returnStructures = if !names != [] then
+        List.concat [returnStructures; !names] else begin
+        returnStructures end in
+      returnStructures
+    | structure -> structure :: returnStructures in
+
+  let reactComponentTransform structures =
+  (* [] in *)
+  List.fold_right transformComponentDefinition structures [] in
+
 
   let transformJsxCall mapper callExpression callArguments attrs =
     (match callExpression.pexp_desc with
@@ -225,7 +504,11 @@ let jsxMapper () =
         (* turn that into
           ReactDOMRe.createElement(~props=ReactDOMRe.props(~props1=foo, ~props2=bar, ()), [|bla|]) *)
         | {loc; txt = Lident id} ->
-          transformLowercaseCall mapper loc attrs callArguments id
+          (match !jsxVersion with
+          | None
+          | Some 2 -> transformLowercaseCall mapper loc attrs callArguments id
+          | Some 3 -> transformLowercaseCall3 mapper loc attrs callArguments id
+          | Some _ -> raise (Invalid_argument "JSX: the JSX version must be 2 or 3"))
 
         | {txt = Ldot (_, anythingNotCreateElementOrMake)} ->
           raise (
@@ -299,28 +582,22 @@ let jsxMapper () =
                   bsConfigLabel,
                   PStr [{configRecord with pstr_desc = Pstr_eval ({innerConfigRecord with pexp_desc = Pexp_record (fields, b)}, a)}]
                 )
-              }::restOfStructure)
+                (* TODO: remove? idk. seems a bit iffy *)
+              }::(reactComponentTransform restOfStructure))
             end
         | _ -> raise (Invalid_argument "JSX: the file-level bs.config's {jsx: ...} config accepts only a version number")
       end
-      | _ -> default_mapper.structure mapper structure
+      (*
+        fuuuck yes. react.component bitches
+      *)
+      | structures -> begin
+        (* TODO: remove default mapper? idk. seems a bit iffy *)
+        default_mapper.structure mapper @@ reactComponentTransform structures
+      end
     ) in
 
   let expr =
     (fun mapper expression -> match expression with
-      | {
-        pexp_desc = Pexp_fun (arg_label, expressionOption, pattern, expression);
-        pexp_attributes
-        } ->
-        let (componentAttribute, nonComponentAttributes) = List.partition (fun (attribute, _) -> attribute.txt = "react.component") pexp_attributes in
-        (match (componentAttribute, nonComponentAttributes) with
-        (* no JSX attribute *)
-        | ([], _) -> default_mapper.expr mapper expression
-        | (_, nonComponentAttributes) ->
-          let _ = print_endline "wowsers" in
-          default_mapper.expr mapper expression)
-
-
        (* Does the function application have the @JSX attribute? *)
        | {
            pexp_desc = Pexp_apply (callExpression, callArguments);
