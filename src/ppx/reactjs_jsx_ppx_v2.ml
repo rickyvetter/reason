@@ -70,13 +70,16 @@ open Longident
 type 'a children = | ListLiteral of 'a | Exact of 'a
 
 (* if children is a list, convert it to an array while mapping each element. If not, just map over it, as usual *)
-let transformChildrenIfListWithType ~loc ~mapper theList =
+let transformChildrenIfListUpper ~loc ~mapper theList =
   let rec transformChildren_ theList accum =
     (* not in the sense of converting a list to an array; convert the AST
        reprensentation of a list to the AST reprensentation of an array *)
     match theList with
-    | {pexp_desc = Pexp_construct ({txt = Lident "[]"}, None)} ->
-      ListLiteral (List.rev accum |> Exp.array ~loc)
+    | {pexp_desc = Pexp_construct ({txt = Lident "[]"}, None)} -> begin
+      match accum with
+      | [singleElement] -> Exact singleElement
+      | accum -> ListLiteral (List.rev accum |> Exp.array ~loc)
+      end
     | {pexp_desc = Pexp_construct (
         {txt = Lident "::"},
         Some {pexp_desc = Pexp_tuple (v::acc::[])}
@@ -87,8 +90,20 @@ let transformChildrenIfListWithType ~loc ~mapper theList =
   transformChildren_ theList []
 
 let transformChildrenIfList ~loc ~mapper theList =
-  match transformChildrenIfListWithType ~loc ~mapper theList with
-  | Exact exp | ListLiteral exp -> exp
+  let rec transformChildren_ theList accum =
+    (* not in the sense of converting a list to an array; convert the AST
+       reprensentation of a list to the AST reprensentation of an array *)
+    match theList with
+    | {pexp_desc = Pexp_construct ({txt = Lident "[]"}, None)} ->
+      List.rev accum |> Exp.array ~loc
+    | {pexp_desc = Pexp_construct (
+        {txt = Lident "::"},
+        Some {pexp_desc = Pexp_tuple (v::acc::[])}
+      )} ->
+      transformChildren_ acc ((mapper.expr mapper v)::accum)
+    | notAList -> mapper.expr mapper notAList
+  in
+  transformChildren_ theList []
 
 let extractChildren ?(removeLastPositionUnit=false) ~loc propsAndChildren =
   let rec allButLast_ lst acc = match lst with
@@ -118,15 +133,23 @@ let jsxMapper () =
 
   let transformUppercaseCall3 modulePath mapper loc attrs _ callArguments =
     let (children, argsWithLabels) = extractChildren ~loc ~removeLastPositionUnit:true callArguments in
-    let (argsKeyRef, argsForMake) = List.partition argIsKeyRef argsWithLabels in
-    let childrenExpr = transformChildrenIfListWithType ~loc ~mapper children in
+    let argsForMake = argsWithLabels in
+    let childrenExpr = transformChildrenIfListUpper ~loc ~mapper children in
     let recursivelyTransformedArgsForMake = argsForMake |> List.map (fun (label, expression) -> (label, mapper.expr mapper expression)) in
     let args = recursivelyTransformedArgsForMake
       @ (match childrenExpr with
         | Exact children -> [(Labelled "children", children)]
         | ListLiteral ({ pexp_desc = Pexp_array list } as expression) when list = [] -> []
-        | ListLiteral _ -> [(Labelled "children", Exp.ident ~loc {loc; txt = Ldot (Lident "ReasonReact", "null")})])
-      @ [ (nolabel, Exp.construct {txt = Lident "()"; loc} None) ] in
+        | ListLiteral expression ->
+          let fragment = Exp.ident ~loc {loc; txt = Ldot (Lident "ReasonReact", "fragment")} in
+          let args = [
+            (nolabel, fragment);
+            (nolabel, expression)
+          ] in
+        [(Labelled "children", Exp.apply
+          ~loc
+          (Exp.ident ~loc {loc; txt = Ldot (Lident "ReactHooks", "createElement")})
+          args)]) in
     let ident = match modulePath with
     | Lident justModule -> Ldot (modulePath, "make")
     | modulePath -> modulePath in
@@ -134,38 +157,17 @@ let jsxMapper () =
     | Lident justModule -> Ldot (modulePath, "props")
     | Ldot(ident, path) -> Ldot (ident, path ^ "_props")
     | modulePath -> modulePath in
-    let wrapWithKeyOrRef wrapper =
-      let (_, expression) = wrapper in
-      let wrapperFnName = match wrapper with
-      | (Asttypes.Labelled "key", _) | (Asttypes.Optional "key", _) -> "wrapKey"
-      | (Asttypes.Labelled "ref", _) | (Asttypes.Optional "ref", _) -> "wrapRef"
-      | _ -> raise (Invalid_argument "Only ref and key are special cased React props.") in
-      Vb.mk ~loc (Pat.mk ~loc Ppat_any) (
-        Exp.apply
-         ~loc
-         (Exp.ident ~loc {loc; txt = Ldot (Lident "ReactHooks", wrapperFnName)})
-         [(nolabel, Exp.ident ~loc {loc; txt = Lident "tmpProps"}); (nolabel, expression)]
-       ) in
-    let wrapPropsWithRefAndKey props =
-      Exp.let_ ~loc Nonrecursive ([Vb.mk ~loc (Pat.mk ~loc (Ppat_var {txt = "tmpProps"; loc})) (
-        Exp.apply
-        ~attrs
-        (* Foo.make *)
-        (Exp.ident ~loc {loc; txt = propsIdent})
-        args
-       )] @ (List.map wrapWithKeyOrRef argsKeyRef)) (Exp.ident ~loc {loc; txt = Lident "tmpProps"}) in
     (* handle key, ref, children *)
     let wrapWithReasonReactElement e = (* ReactHooks.createElement(Component.make, props, ...children) *)
       Exp.apply
         ~loc
         (Exp.ident ~loc {loc; txt = Ldot (Lident "ReactHooks", "createElement")})
-        (* (Exp.ident ~loc {loc; txt = Ldot (modulePath, "make")}) *)
         ([
           (nolabel, Exp.ident ~loc {txt = ident; loc});
-          (nolabel, wrapPropsWithRefAndKey (Exp.ident ~loc {loc; txt = ident}));
-          (nolabel, match childrenExpr with
-            | Exact _ -> Exp.array []
-            | ListLiteral arr -> arr);
+          (nolabel, Exp.apply
+          ~attrs
+          (Exp.ident ~loc {loc; txt = propsIdent})
+          args);
         ]) in
     Exp.apply
       ~loc
@@ -185,7 +187,7 @@ let jsxMapper () =
             pexp_desc =
              Pexp_construct ({txt = Lident "::"}, Some {pexp_desc = Pexp_tuple _ })
              | Pexp_construct ({txt = Lident "[]"}, None)
-          } -> "createStringElement"
+          } -> "createDOMElement"
         (* [@JSX] div(~children= value), coming from <div> ...(value) </div> *)
         | _ -> raise (Invalid_argument "A spread as a DOM element's \
           children don't make sense written together. You can simply remove the spread.")
@@ -303,7 +305,8 @@ let jsxMapper () =
         recursivelyTransformNamedArgsForMake expression ((label, defaultArg, false) :: list)
     | Pexp_fun (Optional(label), defaultArg, _, expression) ->
         recursivelyTransformNamedArgsForMake expression ((label, defaultArg, true) :: list)
-    | Pexp_fun (Nolabel, _, { ppat_desc = Ppat_construct ({txt = Lident "()"}, _) }, expression) -> (expression.pexp_desc, list)
+    | Pexp_fun (Nolabel, _, { ppat_desc = (Ppat_construct ({txt = Lident "()"}, _) | Ppat_any)}, expression) ->
+        (expression.pexp_desc, list)
     | innerExpression -> (innerExpression, list)
   in
 
@@ -332,27 +335,32 @@ let jsxMapper () =
       let names = ref [] in
       let bsRawCreate functionName variableName =
         functionName ^ ".name = '" ^ variableName ^ "';" in
-      let setNamesForBSRaw functionName (loc, payload) =
-        match payload with
-        | PStr [
-          {pstr_desc = Pstr_eval ({
-            pexp_desc = Pexp_constant (Pconst_string (str, delim))
-          } as innest , _)} as inner
-        ] -> let name =
-        {inner with pstr_desc = Pstr_eval (
-          {innest with pexp_desc = Pexp_extension (
-            {txt = "bs.raw"; loc = loc.loc},
-            PStr [
-            {inner with pstr_desc = Pstr_eval (
-              {innest with pexp_desc = Pexp_constant (Pconst_string (bsRawCreate functionName str, delim))},
-              []
-            )}]
-          )},
-          []
-        )} in
-        names := name :: !names
-        (* todo: add __MODULE__ here *)
-        | _ -> ()
+      let setNamesForBSRaw functionName ((loc, payload) as attr) =
+        let setNames str = match str with
+        | {pstr_desc = Pstr_eval ({
+          pexp_desc = Pexp_constant (Pconst_string (str, delim))
+        } as innest , _)} as inner ->
+          let name = {inner with pstr_desc = Pstr_eval (
+            {innest with pexp_desc = Pexp_extension (
+              {txt = "bs.raw"; loc = loc.loc},
+              PStr [
+              {inner with pstr_desc = Pstr_eval (
+                {innest with pexp_desc = Pexp_constant (Pconst_string (bsRawCreate functionName str, delim))},
+                []
+              )}]
+            )},
+            []
+          )} in
+          (* todo: add __MODULE__ here *)
+          names := name :: !names
+        | _ -> () in
+        (match loc with
+        | {txt = "react.component"} ->
+          (match payload with
+          | PStr structures ->
+            List.iter setNames structures
+          | _ -> ())
+        | _ -> ())
       in
       let hasAttr (loc, _) =
         loc.txt = "react.component" in
@@ -381,6 +389,7 @@ let jsxMapper () =
           ptyp_loc = pstr_loc;
           ptyp_attributes = [];
           }, Invariant) in
+        let namedArgListWithKey = ("key", None, true) :: namedArgList in
         let namedTypeList = List.map argToType namedArgList in
         let justNamedTypeList = List.map pluckType namedTypeList in
         let namedTypeParamsList = List.map argToTypeParam namedArgList in
@@ -414,7 +423,7 @@ let jsxMapper () =
             pval_type =
                recursivelyMakeNamedArgsForExternal
                  pstr_loc
-                 namedArgList
+                 namedArgListWithKey
                  (Ast_404.Ast_helper.Typ.arrow
                  Nolabel
                  {
@@ -440,9 +449,19 @@ let jsxMapper () =
               ]
             ) in
         let innerLets = List.map makeLet namedArgList in
+        let innerExpression = Ast_404.Ast_helper.Exp.mk innerFunctionExpression in
+        let innerExpression = (match innerLets with
+        | [] -> innerExpression
+        | innerLets -> Ast_404.Ast_helper.Exp.mk(Pexp_let (
+          Nonrecursive,
+          innerLets,
+          innerExpression
+        ))) in
         {
           binding with
-          pvb_expr = Ast_404.Ast_helper.Exp.mk(Pexp_fun (
+          pvb_expr = Ast_404.Ast_helper.Exp.mk
+          ~attrs:[({loc = pstr_loc; txt = "bs.uncurry"}, PStr [])]
+          (Pexp_fun (
             Nolabel,
             None,
             {
@@ -450,11 +469,7 @@ let jsxMapper () =
               ppat_loc = pstr_loc;
               ppat_attributes = [];
             },
-            Ast_404.Ast_helper.Exp.mk(Pexp_let (
-              Nonrecursive,
-              innerLets,
-              (Ast_404.Ast_helper.Exp.mk innerFunctionExpression)
-            ))
+            innerExpression
           ))
         }
       else
@@ -575,7 +590,7 @@ let jsxMapper () =
 #end *)
               match recordFieldsWithoutJsx with
               (* record empty now, remove the whole bs.config attribute *)
-              | [] -> default_mapper.structure mapper restOfStructure
+              | [] -> default_mapper.structure mapper @@ reactComponentTransform restOfStructure
               | fields -> default_mapper.structure mapper ({
                 pstr_loc;
                 pstr_desc = Pstr_attribute (

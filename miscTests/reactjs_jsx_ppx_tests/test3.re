@@ -10,3 +10,6 @@
 <div bar> childOne </div>;
 <div bar> childOne childTwo </div>;
 <> <span /> </>;
+
+[@react.component "baz"]
+let foo = () => 1;
